@@ -41,6 +41,74 @@ buildpacks.cloudfoundry.org S3 (compiled dependencies)
 - **binary-builder**: Tool for compiling dependencies against specific stacks
 - **buildpacks-release**: BOSH release packaging all buildpacks
 
+## Buildpack Release (BOSH Release) Structure
+
+**Important Distinction**:
+- **Buildpack** (`~/workspace/cloudfoundry/buildpacks/*`) - Source code repositories
+- **Buildpack-Release** (`~/workspace/cloudfoundry/buildpacks-release/`) - BOSH packaging wrapper
+
+### Buildpack-Release Structure
+
+```
+buildpacks-release/
+├── jobs/
+│   └── <buildpack-name>/
+│       └── spec  # References packages by name
+└── packages/
+    ├── <buildpack-name>-cflinuxfs3/  # DEPRECATED (being removed)
+    │   ├── spec          # Package specification
+    │   └── packaging     # Build script
+    ├── <buildpack-name>-cflinuxfs4/  # CURRENT (production)
+    │   ├── spec
+    │   └── packaging
+    └── <buildpack-name>-cflinuxfs5/  # UPCOMING (in development)
+        ├── spec
+        └── packaging
+```
+
+### Job → Package Relationship
+
+Job specs reference packages:
+```yaml
+# jobs/python/spec
+packages:
+  - python-buildpack-cflinuxfs5  # UPCOMING
+  - python-buildpack-cflinuxfs4  # CURRENT (production)
+  - python-buildpack-cflinuxfs3  # DEPRECATED (being removed)
+```
+
+**Note**: Job can reference multiple stacks to support migrations.
+
+Each package contains the compiled buildpack zip for a specific stack.
+
+### Common Tasks
+
+**Remove deprecated stack from all buildpacks**:
+```bash
+# 1. Find all packages for deprecated stack
+find ~/workspace/cloudfoundry/buildpacks-release/packages/ -name "*cflinuxfs3*"
+
+# 2. For each buildpack:
+#    a. Edit jobs/<buildpack-name>/spec - remove package reference
+#    b. Delete packages/<buildpack-name>-cflinuxfs3/ directory
+```
+
+**Check which buildpacks still have a stack**:
+```bash
+rg "cflinuxfs3" ~/workspace/cloudfoundry/buildpacks-release/jobs/*/spec
+```
+
+### Why Separate Packages Per Stack?
+- Different stacks = different libc versions
+- Compiled binaries incompatible across stacks
+- BOSH can't conditionally include packages
+- Solution: One package per stack, job spec references all needed stacks
+
+### Stack Lifecycle
+- **cflinuxfs3**: DEPRECATED - Being removed from all buildpacks
+- **cflinuxfs4**: CURRENT - Production stack in use
+- **cflinuxfs5**: UPCOMING - In development for future releases
+
 ## Buildpack Lifecycle Contracts
 
 Buildpacks are **executable scripts** that CF Platform calls in sequence:
@@ -185,14 +253,20 @@ dependencies:
     version: 3.2.2
     uri: https://buildpacks.cloudfoundry.org/dependencies/ruby/ruby_3.2.2_...cflinuxfs4.tgz
     sha256: abc123...
-    cf_stacks: [cflinuxfs4]  # Only works on cflinuxfs4
+    cf_stacks: [cflinuxfs4]  # Stack compatibility
 ```
 
+**Stack Lifecycle**:
+- **cflinuxfs3**: DEPRECATED (being removed)
+- **cflinuxfs4**: CURRENT (production)
+- **cflinuxfs5**: UPCOMING (in development)
+
 **Contract**:
-- Buildpack packager uses `-stack=cflinuxfs4` flag to filter
-- CF provides current stack to buildpacks
+- Buildpack packager uses `-stack=cflinuxfs4` (or cflinuxfs5) flag to filter
+- CF provides current stack to buildpacks via environment
 - Buildpacks use `manifest.Stack()` to validate compatibility
 - Different binaries for different stacks (compiled against different libc/system libs)
+- Migration pattern: Buildpacks support multiple stacks during transition periods
 
 ## Switchblade: Testing Contract
 
@@ -239,22 +313,23 @@ Expect(body).To(Equal("Hello World"))
 #### 2. buildpack pipeline
 - Per-language: unit tests → integration tests → package → upload
 - Branches: master (stable), develop (bleeding edge)
-- Stacks: Separate artifacts for cflinuxfs3 and cflinuxfs4
+- Stacks: Separate artifacts per stack (cflinuxfs4 current, cflinuxfs5 upcoming, cflinuxfs3 deprecated)
 
 #### 3. brats pipeline
 - Nightly smoke tests
 - Deploys test apps via Switchblade
 - Validates each buildpack in real CF environment
 
-#### 4. cflinuxfs4
+#### 4. cflinuxfs* (stack pipelines)
 - Rootfs release (base filesystem)
 - Tracks CVEs, security patches
 - Buildpacks depend on this for system environment
+- Current: cflinuxfs4, Upcoming: cflinuxfs5, Deprecated: cflinuxfs3
 
 ### Concourse Patterns
 
 - **ytt templating**: Generates pipeline YAML (prevents duplication)
-- **Resources**: Git repos, Shepherd (CI env leases), Cron triggers
+- **Resources**: Git repos, bosh-bootloader enviorments, Cron triggers
 - **Coordination**: Build native binaries before buildpack
 
 ## Repository Map
@@ -266,7 +341,7 @@ Expect(body).To(Equal("Hello World"))
 - **switchblade** - Integration testing framework (Go, 66 files)
 
 #### Language Buildpacks (~/workspace/cloudfoundry/buildpacks/)
-- **java-buildpack** - Java/JVM applications (870 files, Ruby-based)
+- **java-buildpack** - Java/JVM applications (Go-based via feature/go-migration branch)
 - **go-buildpack** - Go applications
 - **python-buildpack** - Python applications
 - **ruby-buildpack** - Ruby applications
@@ -285,7 +360,8 @@ Expect(body).To(Equal("Hello World"))
 - **binary-builder** - Dependency compilation tool (Ruby, 71 files)
 - **buildpacks-release** - BOSH release packaging
 - **cf-deployment** - CF runtime manifests
-- **cflinuxfs4-release** - Root filesystem
+- **cflinuxfs4-release** - Root filesystem (current stack)
+- **cflinuxfs5-release** - Root filesystem (upcoming stack)
 - **jvmkill** - JVM agent (C/Java)
 
 ### Common GitHub Repos (Not Locally Cloned)
@@ -452,7 +528,7 @@ For detailed architectural contracts and patterns, see:
 ### Component Languages
 - libbuildpack: Go (shared library)
 - Most buildpacks: Go (with Bash wrappers)
-- Java buildpack: Ruby (legacy, predates libbuildpack)
+- Java buildpack: Go (migrated from Ruby via feature/go-migration branch)
 - buildpacks-ci: Ruby
 - binary-builder: Ruby
 

@@ -12,7 +12,7 @@ This document lists all buildpack-related repositories, organized by category.
   - **Critical**: ALL language buildpacks depend on this
 
 ### Language Buildpacks (~/workspace/cloudfoundry/buildpacks/)
-- **java-buildpack** - Java/JVM applications (Ruby-based, predates libbuildpack)
+- **java-buildpack** - Java/JVM applications (Go-based via feature/go-migration branch)
 - **go-buildpack** - Go applications
 - **python-buildpack** - Python applications
 - **ruby-buildpack** - Ruby applications
@@ -32,8 +32,11 @@ This document lists all buildpack-related repositories, organized by category.
 
 ### Infrastructure
 - **cf-deployment** - CF runtime manifests
-- **cflinuxfs4-release** - Root filesystem (stack)
+- **cflinuxfs4-release** - Root filesystem (current production stack)
+- **cflinuxfs5-release** - Root filesystem (upcoming stack)
 - **jvmkill** - JVM agent (C/Java)
+
+**Note**: cflinuxfs3 is deprecated and being removed from buildpacks.
 
 ## GitHub Repos (Not Locally Cloned)
 
@@ -210,9 +213,12 @@ org:cloudfoundry "buildpack" path:pipelines/ filename:*.yml
 These repos are related but not buildpacks:
 
 - **cloudfoundry/cf-deployment** - CF runtime manifests (uses buildpacks)
-- **cloudfoundry/cflinuxfs4** - Rootfs (stack buildpacks run on)
+- **cloudfoundry/cflinuxfs4** - Rootfs (current production stack)
+- **cloudfoundry/cflinuxfs5** - Rootfs (upcoming stack)
 - **cloudfoundry/diego-release** - Container runtime (executes staged apps)
 - **cloudfoundry/garden-runc-release** - Low-level container runtime
+
+**Note**: cflinuxfs3 is deprecated and no longer maintained.
 
 ---
 

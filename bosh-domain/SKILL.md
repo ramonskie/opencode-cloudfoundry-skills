@@ -20,6 +20,10 @@ Use this skill when:
 BOSH uses a **star topology** with the Director at the center:
 
 ```
+User/Operator
+    ↓ (HTTP/HTTPS API)
+BOSH CLI (Go client)
+    ↓ (HTTP/HTTPS)
 Director (Ruby) -- NATS Message Bus -- Agent (Go, one per VM)
     |                                      |
     +-- ExternalCPI (subprocess)          +-- Local filesystem/disk management
@@ -31,6 +35,7 @@ Director (Ruby) -- NATS Message Bus -- Agent (Go, one per VM)
 
 ### Key Components
 
+- **BOSH CLI** (bosh-cli/): Command-line client for interacting with Director (Go, v7.9.15+ installed)
 - **Director** (bosh/): Orchestration engine written in Ruby, manages deployments
 - **Agent** (bosh-agent/): Runs on each VM, executes director commands, written in Go
 - **CPI** (bosh-*-cpi-release/): Cloud Provider Interface, infrastructure-specific plugins
@@ -38,7 +43,307 @@ Director (Ruby) -- NATS Message Bus -- Agent (Go, one per VM)
 - **Bootloader** (bosh-bootloader/): Bootstrap tool to deploy BOSH itself
 - **Deployment Manifests** (bosh-deployment/): Reference configurations for various infrastructures
 
+## BOSH CLI (v2+)
+
+The BOSH CLI is the primary interface for operators and developers to interact with the BOSH Director.
+
+### Architecture
+
+```
+User → BOSH CLI (Go binary) → HTTP/HTTPS → Director API → NATS → Agents
+                    ↓
+                Config Files
+                (~/.bosh/config)
+```
+
+### Installation & Configuration
+
+**Installed Version**: v7.9.15 (check with `bosh --version`)
+
+**Configuration Locations**:
+- `~/.bosh/config` - CLI configuration (environments, credentials)
+- Environment variables: `BOSH_ENVIRONMENT`, `BOSH_CLIENT`, `BOSH_CLIENT_SECRET`, `BOSH_DEPLOYMENT`
+
+**Common Setup**:
+```bash
+# Alias an environment
+bosh alias-env my-env -e 10.0.0.6 --ca-cert <(bosh int creds.yml --path /director_ssl/ca)
+
+# Log in
+bosh -e my-env log-in
+
+# Set deployment context
+export BOSH_ENVIRONMENT=my-env
+export BOSH_DEPLOYMENT=my-deployment
+```
+
+### Command Categories
+
+#### **Deployment Management** (Most Common)
+- `bosh deploy` (`d`) - Deploy or update deployment
+- `bosh delete-deployment` (`deld`) - Delete deployment
+- `bosh vms` - List all VMs across deployments
+- `bosh instances` (`is`) - List instances in current deployment
+- `bosh ssh` - SSH into instances
+- `bosh scp` - SCP files to/from instances
+- `bosh logs` - Fetch logs from instances
+- `bosh manifest` (`man`) - Show deployment manifest
+
+#### **Release Management**
+- `bosh releases` (`rs`) - List uploaded releases
+- `bosh upload-release` (`ur`) - Upload release to Director
+- `bosh create-release` (`cr`) - Create dev/final release
+- `bosh finalize-release` - Create final release from dev tarball
+- `bosh export-release` - Export compiled release
+- `bosh delete-release` (`delr`) - Delete release from Director
+- `bosh inspect-release` - Show release contents (jobs, packages)
+
+#### **Stemcell Management**
+- `bosh stemcells` (`ss`) - List uploaded stemcells
+- `bosh upload-stemcell` (`us`) - Upload stemcell to Director
+- `bosh delete-stemcell` (`dels`) - Delete stemcell from Director
+- `bosh repack-stemcell` - Repack stemcell with custom content
+
+#### **Instance Lifecycle**
+- `bosh start` - Start stopped instances
+- `bosh stop` - Stop instances (keeps VMs)
+- `bosh restart` - Restart job processes
+- `bosh recreate` - Recreate VMs (destroy + create)
+- `bosh run-errand` - Execute errand job
+
+#### **Debugging & Troubleshooting**
+- `bosh tasks` (`ts`) - List running/recent tasks
+- `bosh task` (`t`) - Track task output
+- `bosh events` - Show audit events
+- `bosh cloud-check` (`cck`) - Cloud consistency check
+- `bosh locks` - Show active locks
+- `bosh curl` - Make HTTP request to Director API
+- `bosh pcap` - Capture network packets on instance
+
+#### **Configuration Management**
+- `bosh cloud-config` (`cc`) - Show cloud config
+- `bosh update-cloud-config` (`ucc`) - Update cloud config
+- `bosh runtime-config` (`rc`) - Show runtime config
+- `bosh update-runtime-config` (`urc`) - Update runtime config
+- `bosh cpi-config` - Show CPI config
+- `bosh configs` (`cs`) - List all configs
+
+#### **Environment Bootstrap** (Direct BOSH without Director)
+- `bosh create-env` - Create/update standalone BOSH (bootstrap)
+- `bosh delete-env` - Delete standalone BOSH
+- `bosh start-env` - Start stopped BOSH environment
+- `bosh stop-env` - Stop BOSH environment
+
+#### **Release Development**
+- `bosh init-release` - Initialize new release
+- `bosh generate-job` - Create job skeleton
+- `bosh generate-package` - Create package skeleton
+- `bosh add-blob` - Add blob to release
+- `bosh sync-blobs` - Download blobs from blobstore
+- `bosh upload-blobs` - Upload blobs to blobstore
+- `bosh vendor-package` - Vendor external package
+
+### Key Flags
+
+**Environment Selection**:
+- `-e, --environment` - Target Director (or `$BOSH_ENVIRONMENT`)
+- `-d, --deployment` - Target deployment (or `$BOSH_DEPLOYMENT`)
+
+**Authentication**:
+- `--client` - Username or UAA client (or `$BOSH_CLIENT`)
+- `--client-secret` - Password or UAA secret (or `$BOSH_CLIENT_SECRET`)
+- `--ca-cert` - Director CA certificate (or `$BOSH_CA_CERT`)
+
+**Output Control**:
+- `--json` - Output as JSON (for scripting)
+- `--column` - Filter output columns
+- `--no-color` - Disable colored output
+- `-n, --non-interactive` - Don't prompt for input
+
+**Deployment Options** (for `bosh deploy`):
+- `--vars-file` (`-l`) - Load variables from YAML file
+- `--var` (`-v`) - Set variable (key=value)
+- `--ops-file` (`-o`) - Apply ops file to manifest
+- `--recreate` - Recreate all VMs
+- `--fix` - Recover deployment from partial state
+- `--skip-drain` - Skip drain scripts (dangerous)
+- `--canaries` - Override canary count
+- `--max-in-flight` - Override max parallel operations
+
+### Common Workflows
+
+#### **Deploy a Release**
+```bash
+# 1. Upload stemcell and release
+bosh upload-stemcell ~/stemcells/bosh-stemcell-1.234-aws-xen-hvm-ubuntu-jammy-go_agent.tgz
+bosh upload-release ~/releases/my-release-1.0.0.tgz
+
+# 2. Deploy
+bosh -d my-deployment deploy manifest.yml \
+  -l vars.yml \
+  -o ops/custom.yml \
+  -v version=1.0.0
+
+# 3. Check deployment
+bosh -d my-deployment vms
+bosh -d my-deployment instances
+```
+
+#### **Debug Failing Deployment**
+```bash
+# 1. Check task output
+bosh tasks --recent=10
+bosh task 1234  # Follow specific task
+
+# 2. SSH to failing instance
+bosh -d my-deployment ssh my-vm/0
+
+# 3. Check logs
+bosh -d my-deployment logs my-vm/0
+
+# 4. Run cloud-check
+bosh -d my-deployment cloud-check --auto
+```
+
+#### **Create Development Release**
+```bash
+# In release directory
+bosh create-release --force --timestamp-version
+bosh upload-release
+bosh -d test-deployment deploy manifest.yml
+```
+
+#### **Bootstrap BOSH Director**
+```bash
+# Using bosh-deployment manifests
+bosh create-env bosh-deployment/bosh.yml \
+  -o bosh-deployment/aws/cpi.yml \
+  --vars-store ./creds.yml \
+  --state ./state.json \
+  -v access_key_id=... \
+  -v secret_access_key=...
+```
+
+### CLI ↔ Director Contract
+
+**Authentication Flow**:
+1. CLI reads config from `~/.bosh/config` or env vars
+2. Sends HTTP request to Director API with basic auth or UAA token
+3. Director validates credentials via UAA or local user database
+4. Director returns session token for subsequent requests
+
+**Task Execution Flow**:
+1. CLI sends deployment/action request to Director
+2. Director creates task and returns task ID immediately
+3. CLI polls task status via `/tasks/{id}` endpoint
+4. CLI streams task output in real-time
+5. Task completes with success/error state
+
+**Manifest Processing**:
+1. CLI interpolates variables (`--var`, `--vars-file`)
+2. CLI applies ops files (`--ops-file`) sequentially
+3. CLI sends final manifest to Director via HTTP POST
+4. Director validates manifest schema
+5. Director creates deployment plan and executes
+
+### Common Use Cases
+
+**For Operators**:
+- Deploy/update production systems: `bosh deploy`
+- Monitor deployments: `bosh vms`, `bosh instances`
+- Troubleshoot issues: `bosh ssh`, `bosh logs`, `bosh cloud-check`
+- Manage infrastructure: `bosh update-cloud-config`
+
+**For Release Developers**:
+- Create releases: `bosh create-release`
+- Test locally: `bosh upload-release && bosh deploy`
+- Package blobs: `bosh add-blob`, `bosh upload-blobs`
+- Inspect releases: `bosh inspect-release`
+
+**For CI/CD Pipelines**:
+- Automated deployments: `bosh deploy --non-interactive --json`
+- Release builds: `bosh create-release --tarball=release.tgz`
+- Task monitoring: `bosh task <id> --json`
+
+### CLI vs Director vs Agent
+
+| Component | Role | Language | Users |
+|-----------|------|----------|-------|
+| **CLI** | User interface | Go | Operators, developers |
+| **Director** | Orchestration | Ruby | CLI (API consumer) |
+| **Agent** | VM execution | Go | Director (via NATS) |
+
+**Key Distinction**: 
+- CLI is **stateless** (config in `~/.bosh/config`)
+- Director is **stateful** (database with deployments, VMs, tasks)
+- Agent is **per-VM** (one agent per managed instance)
+
+### Environment Variables Reference
+
+```bash
+BOSH_ENVIRONMENT=my-director       # Target Director
+BOSH_CLIENT=admin                  # Username or UAA client
+BOSH_CLIENT_SECRET=secret          # Password or secret
+BOSH_DEPLOYMENT=my-app            # Default deployment
+BOSH_CA_CERT=/path/to/ca.crt      # Director CA certificate
+BOSH_NON_INTERACTIVE=true         # Skip prompts (CI usage)
+BOSH_CONFIG=/custom/config        # Custom config location
+```
+
+### Tips & Best Practices
+
+**Aliases Save Typing**:
+```bash
+alias bd='bosh deploy'
+alias bi='bosh instances'
+alias bv='bosh vms'
+alias bssh='bosh ssh'
+```
+
+**Use Environment Variables**:
+```bash
+# In your shell profile
+export BOSH_ENVIRONMENT=prod
+export BOSH_DEPLOYMENT=my-app
+# Now just: bosh vms (no -e/-d flags)
+```
+
+**JSON Output for Scripting**:
+```bash
+# Get VM IPs programmatically
+bosh vms --json | jq -r '.Tables[0].Rows[].ips'
+```
+
+**Manifest Interpolation**:
+```bash
+# Preview final manifest without deploying
+bosh interpolate manifest.yml \
+  -l vars.yml \
+  -o ops/custom.yml > final-manifest.yml
+```
+
+**Quick Task Tracking**:
+```bash
+# Deploy in background, track separately
+bosh deploy manifest.yml &
+bosh tasks --recent=1 | head -2  # Get task ID
+bosh task <id>  # Track progress
+```
+
 ## Key Cross-Component Contracts
+
+### CLI ↔ Director (HTTP/HTTPS API)
+- **Transport**: RESTful HTTP(S) API with JSON payloads
+- **Authentication**: Basic auth, UAA OAuth2, or client certificates
+- **Pattern**: Request/response for commands, polling for long-running tasks
+- **Key Endpoints**:
+  - `POST /deployments` - Create/update deployment (returns task ID)
+  - `GET /tasks/{id}` - Poll task status
+  - `GET /tasks/{id}/output` - Stream task logs
+  - `GET /deployments` - List deployments
+  - `POST /releases` - Upload release tarball
+  - `POST /stemcells` - Upload stemcell
+- **Contract**: CLI polls tasks asynchronously; Director never blocks on long operations
 
 ### Director ↔ Agent (NATS Protocol)
 - **Transport**: NATS message bus (custom fork supporting TLS + plaintext)

@@ -33,7 +33,7 @@ buildpack encapsulates common buildpack functionality so language buildpacks don
 - `DefaultVersion(depName)` - Resolve version constraints (e.g., "3.2.x" → "3.2.2")
 - `AllDependencyVersions(depName)` - List all available versions
 - `IsCached()` - Check if buildpack is in offline/cached mode
-- `Stack()` - Return current stack (cflinuxfs3/cflinuxfs4)
+- `Stack()` - Return current stack (cflinuxfs3/cflinuxfs4/cflinuxfs5)
 
 **Contract**:
 - manifest.yml MUST exist in buildpack root
@@ -211,6 +211,241 @@ config_vars:
   PYTHON_VERSION: 3.11.0
 ```
 
+## Multi-Buildpack Communication Protocol
+
+When multiple buildpacks are used together (multi-buildpack staging), they communicate via a directory-based protocol.
+
+### Supply/Finalize Pattern
+
+**Supply Phase** (buildpacks 0 to N-1):
+- Runs for ALL buildpacks in the chain
+- Installs dependencies to `$DEPS_DIR/$DEPS_IDX/`
+- Writes `config.yml` for communication with final buildpack
+- Non-destructive (doesn't modify app directory)
+- Each buildpack isolated via unique $DEPS_IDX
+
+**Finalize Phase** (buildpack N only):
+- Runs ONLY for the last buildpack in chain
+- Reads from ALL `$DEPS_DIR/*/config.yml` files
+- Integrates all buildpack contributions
+- Modifies app directory for launch
+- Writes final startup configuration
+
+### Directory Structure
+
+```
+/tmp/
+├── app/              # Application source code
+├── cache/            # Persistent cache between stagings
+└── deps/             # Multi-buildpack dependencies
+    ├── 0/            # First buildpack contributions ($DEPS_IDX=0)
+    │   ├── config.yml       # Configuration for final buildpack
+    │   ├── bin/             # Binaries to add to $PATH
+    │   ├── lib/             # Libraries for $LD_LIBRARY_PATH
+    │   ├── include/         # Headers for compilation
+    │   └── env/             # Environment variables
+    ├── 1/            # Second buildpack contributions ($DEPS_IDX=1)
+    │   └── config.yml
+    ├── 2/            # Third buildpack contributions ($DEPS_IDX=2)
+    │   └── config.yml
+    └── ...
+```
+
+### config.yml Contract
+
+Each buildpack in supply phase can write `$DEPS_DIR/$DEPS_IDX/config.yml` to communicate with the final buildpack.
+
+**Example** (from Java ecosystem):
+```yaml
+# $DEPS_DIR/0/config.yml (JRE buildpack)
+name: openjdk
+container: play
+environment_variables:
+  JAVA_HOME: /tmp/deps/0
+java_opts:
+  - -Xmx512m
+  - -Xms256m
+```
+
+**Contract**:
+- Schema is buildpack-specific (no universal standard)
+- Final buildpack MUST document expected config.yml format
+- Config files are additive (final buildpack merges all)
+- Missing config.yml is valid (optional communication)
+
+### Integration Pattern (Final Buildpack)
+
+How the final buildpack reads previous buildpacks' contributions:
+
+```go
+// Get deps directory root
+depsDir := stager.DepsDir()        // e.g., /tmp/deps/
+currentIdx := stager.DepsIdx()     // e.g., 2 (this is buildpack #2)
+
+// Iterate through all previous buildpacks
+for idx := 0; idx < currentIdx; idx++ {
+    configPath := filepath.Join(depsDir, strconv.Itoa(idx), "config.yml")
+    
+    // Check if config exists
+    if _, err := os.Stat(configPath); os.IsNotExist(err) {
+        continue  // Skip if no config provided
+    }
+    
+    // Read and parse config
+    data, _ := ioutil.ReadFile(configPath)
+    var config SupplyConfig
+    yaml.Unmarshal(data, &config)
+    
+    // Integrate into final buildpack behavior
+    // E.g., add to PATH, set env vars, configure runtime
+}
+```
+
+### $DEPS_DIR/$DEPS_IDX Isolation
+
+Each buildpack gets its own isolated subdirectory:
+
+```bash
+# Buildpack 0 (JRE supply)
+DEPS_DIR=/tmp/deps
+DEPS_IDX=0
+# Installs to: /tmp/deps/0/
+
+# Buildpack 1 (dependency supply)
+DEPS_DIR=/tmp/deps
+DEPS_IDX=1
+# Installs to: /tmp/deps/1/
+
+# Buildpack 2 (app buildpack finalize)
+DEPS_DIR=/tmp/deps
+DEPS_IDX=2
+# Reads from: /tmp/deps/0/, /tmp/deps/1/
+# Installs to: /tmp/deps/2/
+```
+
+**Why Isolation Matters**:
+- Prevents file conflicts between buildpacks
+- Each buildpack can use common directory names (bin/, lib/)
+- Final buildpack can iterate numerically (0, 1, 2, ...)
+- Enables composable buildpack architecture
+
+### Real-World Example: Java Multi-Buildpack
+
+**Scenario**: Deploy Java app with custom JRE
+
+**Buildpack Chain**:
+1. `java-jre-buildpack` (supply) - Installs OpenJDK
+2. `java-app-buildpack` (finalize) - Compiles app, reads JRE config
+
+**Supply Phase** (java-jre-buildpack):
+```bash
+# Called as: bin/supply /tmp/app /tmp/cache /tmp/deps 0
+# Installs JRE to /tmp/deps/0/
+# Writes config:
+cat > /tmp/deps/0/config.yml <<EOF
+name: openjdk
+version: 17.0.5
+java_home: /tmp/deps/0
+EOF
+```
+
+**Finalize Phase** (java-app-buildpack):
+```bash
+# Called as: bin/finalize /tmp/app /tmp/cache /tmp/deps 1
+# Reads /tmp/deps/0/config.yml
+# Sets JAVA_HOME from config
+# Compiles app using JRE from /tmp/deps/0/
+# Writes startup script using JAVA_HOME
+```
+
+### libbuildpack Pattern
+
+Modern buildpacks using libbuildpack (all Go-based buildpacks including java-buildpack after feature/go-migration):
+- Use `stager.DepDir()` and `stager.DepsDir()` methods
+- Automatic $DEPS_IDX parsing from args
+- Follows CF multi-buildpack spec exactly
+- Example: go-buildpack, python-buildpack, php-buildpack, java-buildpack
+
+**Standard pattern**:
+```go
+// In supply or finalize
+stager := libbuildpack.NewStager(os.Args[1:], logger, manifest)
+
+// Get this buildpack's isolated directory
+myDepDir := stager.DepDir()  // Returns /tmp/deps/$DEPS_IDX/
+
+// Get parent deps directory for iteration
+allDepsDir := stager.DepsDir()  // Returns /tmp/deps/
+
+// Get this buildpack's index
+myIdx := stager.DepsIdx()  // Returns integer like 0, 1, 2
+```
+
+### Testing Multi-Buildpack Scenarios
+
+Using Switchblade:
+
+```go
+deployment, logs, err := platform.Deploy.Execute(
+    "multi-buildpack-test",
+    "./fixtures/java_app",
+    switchblade.WithBuildpacks(
+        "https://github.com/cloudfoundry/jre-buildpack",   // Supply
+        "https://github.com/cloudfoundry/java-buildpack",  // Finalize
+    ),
+)
+
+// Verify supply buildpack ran
+assert.Contains(string(logs), "Installing JRE")
+
+// Verify finalize buildpack integrated JRE
+assert.Contains(string(logs), "Using JRE from /tmp/deps/0")
+```
+
+### Common Patterns
+
+**Pattern 1: Language Runtime Supply**
+- Supply buildpack installs runtime (Python, Ruby, Node.js)
+- Finalize buildpack installs app dependencies using that runtime
+- Enables swapping runtime versions without changing app buildpack
+
+**Pattern 2: Native Library Supply**
+- Supply buildpack installs system libraries (libpq, imagemagick)
+- Finalize buildpack links app against those libraries
+- Enables reusing compiled libraries across apps
+
+**Pattern 3: Multi-Language Apps**
+- Supply: Node.js buildpack (frontend build tools)
+- Supply: Python buildpack (backend runtime)
+- Finalize: App buildpack (integrates both)
+
+### Debugging Multi-Buildpack Issues
+
+**Check $DEPS_DIR structure**:
+```bash
+# In staging logs, look for:
+ls -la /tmp/deps/
+# Should show: 0/ 1/ 2/ (one per buildpack)
+```
+
+**Verify config.yml written**:
+```bash
+cat /tmp/deps/0/config.yml
+# Should contain valid YAML
+```
+
+**Check final buildpack reads config**:
+```bash
+# In finalize logs, look for:
+Reading configuration from /tmp/deps/0/config.yml
+```
+
+**Common Issues**:
+- Config.yml schema mismatch (final buildpack expects different format)
+- Missing config.yml (supply buildpack didn't write it)
+- File permissions (config.yml not readable)
+- $DEPS_IDX confusion (hardcoded paths instead of using $DEPS_IDX)
+
 ## Three-Tier Caching Strategy Detailed
 
 ### Tier 1: Buildpack Cache (Offline Mode)
@@ -302,7 +537,12 @@ installer.SetAppCacheDir(stager.CacheDir())
 ## Stack Filtering Contract
 
 ### Purpose
-Different stacks (cflinuxfs3, cflinuxfs4) require different compiled binaries due to different system libraries (libc versions, etc.).
+Different stacks (cflinuxfs3, cflinuxfs4, cflinuxfs5) require different compiled binaries due to different system libraries (libc versions, etc.).
+
+**Stack Lifecycle**:
+- **cflinuxfs3**: DEPRECATED - Being removed from buildpacks
+- **cflinuxfs4**: CURRENT - Production stack in active use
+- **cflinuxfs5**: UPCOMING - In development for future releases
 
 ### Manifest Format
 
@@ -312,7 +552,7 @@ dependencies:
     version: 3.2.2
     uri: https://buildpacks.cloudfoundry.org/dependencies/ruby/ruby_3.2.2_cflinuxfs4.tgz
     sha256: abc123...
-    cf_stacks: [cflinuxfs4]  # Only compatible with cflinuxfs4
+    cf_stacks: [cflinuxfs4]  # Stack compatibility (cflinuxfs3 deprecated, cflinuxfs4 current, cflinuxfs5 upcoming)
 ```
 
 ### Buildpack Packager Filtering
@@ -392,7 +632,7 @@ func TestPythonBuildpack(t *testing.T) {
 - `WithEnv(map[string]string)` - Set environment variables
 - `WithServices(...Service)` - Bind services
 - `WithoutInternetAccess()` - Test offline mode
-- `WithStack(string)` - Specify stack (cflinuxfs3/cflinuxfs4)
+- `WithStack(string)` - Specify stack (cflinuxfs4 current, cflinuxfs5 upcoming, cflinuxfs3 deprecated)
 
 **Contract**:
 - Same test code works on CF and Docker (no platform-specific logic)
