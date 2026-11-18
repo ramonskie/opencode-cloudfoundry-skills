@@ -5,547 +5,83 @@ description: This skill should be used when working in Cloud Foundry buildpacks 
 
 # Cloud Foundry Buildpacks Domain Knowledge
 
-## When to Use This Skill
+Use when changing buildpack code, `libbuildpack` contracts, manifests, integration tests, or CI config, or when debugging staging.
+Details and code samples: `references/architecture.md`.
 
-Use this skill when:
-- Working in any buildpack-related repository in ~/workspace/cloudfoundry/
-- Making changes that affect libbuildpack contracts or APIs
-- Understanding buildpack lifecycle (detect, supply, finalize, release)
-- Debugging buildpack staging or runtime issues
-- Working with buildpack testing (Switchblade) or CI (buildpacks-ci)
-- Understanding dependency management and caching strategies
-- Searching for buildpack code across multiple repositories
-
-## Architecture Overview
-
-Cloud Foundry buildpacks follow a **shared library pattern** with libbuildpack at the center:
+## Architecture
 
 ```
-CF Platform
-    ↓ (calls scripts with args)
-Language Buildpack (Go/Ruby/Python/Java/etc.)
-    ↓ (imports)
-libbuildpack (shared Go library) ⭐ CRITICAL
-    ↓ (reads)
-manifest.yml (dependency declarations)
-    ↓ (references)
-buildpacks.cloudfoundry.org S3 (compiled dependencies)
+CF platform -> language buildpack (Go + bash wrappers) -> libbuildpack (shared Go lib)
+            -> manifest.yml -> buildpacks.cloudfoundry.org (compiled dependencies)
 ```
 
-### Key Components
+- **libbuildpack**: shared library (Manifest, Installer, Stager, Logger). Changes affect every language buildpack, so read it first.
+- **Language buildpacks**: go, python, ruby, php, nodejs, java (Go-based), dotnet-core, staticfile, binary, apt, nginx, r, hwc.
+- **switchblade**: integration test framework for CF and Docker.
+- **buildpacks-ci**: Concourse pipelines (ytt) and the dependency bot.
+- **binary-builder**: compiles dependencies per stack.
+- **buildpacks-release**: BOSH release, one package per buildpack and stack.
 
-- **libbuildpack** ⭐: Shared Go library providing Manifest, Installer, Stager, Logger
-- **Language buildpacks**: Python, Ruby, Go, Java, PHP, Node.js, etc. (12+ buildpacks)
-- **Switchblade**: Testing framework abstracting CF and Docker platforms
-- **buildpacks-ci**: Concourse-based CI/CD pipelines
-- **binary-builder**: Tool for compiling dependencies against specific stacks
-- **buildpacks-release**: BOSH release packaging all buildpacks
+## Lifecycle
 
-## Buildpack Release (BOSH Release) Structure
+Scripts get positional args from CF: `bin/detect <build>`, `bin/supply <build> <cache> <deps> <idx>`, `bin/finalize <build> <cache> <deps> <idx> <profile>`, `bin/release <build>`.
+- Order: detect, supply (all buildpacks), finalize (last only), release.
+- `DEPS_IDX` isolates each buildpack in `$DEPS_DIR/<idx>/`. Supply buildpacks pass data to the final one via `config.yml` (schema is buildpack-specific).
+- Typical `bin/*` is a bash script (not POSIX sh) that builds and runs a Go binary. Non-zero exit means failure; specific codes are buildpack-defined.
 
-**Important Distinction**:
-- **Buildpack** (`~/workspace/cloudfoundry/buildpacks/*`) - Source code repositories
-- **Buildpack-Release** (`~/workspace/cloudfoundry/buildpacks-release/`) - BOSH packaging wrapper
+## Manifest and stacks
 
-### Buildpack-Release Structure
+- `manifest.yml` lists dependencies (name, version, uri, sha256, cf_stacks, source, source_sha256).
+- Dependencies are filtered by the `CF_STACK` env var at runtime and by the packager at package time.
+- `AllDependencyVersions` and `GetEntry` filter by stack. `InstallOnlyVersion*` fails with "more than one version of X found" if a stack sees two versions of one dependency.
+- Stacks: cflinuxfs4 (current), cflinuxfs5 (becomes the default once fs4 is deprecated, planned next year), cflinuxfs3 (deprecated, superseded by fs4).
+- Manifest entries are updated by bot PRs (from buildpacks-ci). Check which stacks a bumped entry lists before merging.
 
-```
-buildpacks-release/
-├── jobs/
-│   └── <buildpack-name>/
-│       └── spec  # References packages by name
-└── packages/
-    ├── <buildpack-name>-cflinuxfs3/  # DEPRECATED (being removed)
-    │   ├── spec          # Package specification
-    │   └── packaging     # Build script
-    ├── <buildpack-name>-cflinuxfs4/  # CURRENT (production)
-    │   ├── spec
-    │   └── packaging
-    └── <buildpack-name>-cflinuxfs5/  # UPCOMING (in development)
-        ├── spec
-        └── packaging
-```
+## Dependency installation
 
-### Job → Package Relationship
+1. Cached buildpack: file in `dependencies/` (offline).
+2. App cache: `$CACHE_DIR/dependencies`, keyed by SHA256 of the URI (needs `SetAppCacheDir`).
+3. Remote download from the manifest URI. SHA256 is always verified.
 
-Job specs reference packages:
-```yaml
-# jobs/python/spec
-packages:
-  - python-buildpack-cflinuxfs5  # UPCOMING
-  - python-buildpack-cflinuxfs4  # CURRENT (production)
-  - python-buildpack-cflinuxfs3  # DEPRECATED (being removed)
-```
+## Testing
 
-**Note**: Job can reference multiple stacks to support migrations.
+- **Unit**: Go packages with mocks (`scripts/unit.sh`).
+- **Integration**: switchblade, same test on CF or Docker (`scripts/integration.sh`). Fixtures live in `fixtures/`.
+- **BRATS**: configured in buildpacks-ci and the buildpack repos but not used (`skip_brats: true` for all buildpacks, not in PR workflows). Do not rely on it.
 
-Each package contains the compiled buildpack zip for a specific stack.
+## CI (buildpacks-ci)
 
-### Common Tasks
+- `pipelines/dependency-builds`: builds dependencies and opens manifest bump PRs. `config.yml` maps each dependency to its buildpacks and version lines; a dependency used by several buildpacks is shared across them.
+- `pipelines/buildpack`: per-buildpack unit, integration, package, release. Per-buildpack options live in `*-values.yml`.
+- Also: rootfs (cflinuxfs) pipelines and CVE checks.
 
-**Remove deprecated stack from all buildpacks**:
-```bash
-# 1. Find all packages for deprecated stack
-find ~/workspace/cloudfoundry/buildpacks-release/packages/ -name "*cflinuxfs3*"
+## Searching
 
-# 2. For each buildpack:
-#    a. Edit jobs/<buildpack-name>/spec - remove package reference
-#    b. Delete packages/<buildpack-name>-cflinuxfs3/ directory
-```
-
-**Check which buildpacks still have a stack**:
-```bash
-rg "cflinuxfs3" ~/workspace/cloudfoundry/buildpacks-release/jobs/*/spec
-```
-
-### Why Separate Packages Per Stack?
-- Different stacks = different libc versions
-- Compiled binaries incompatible across stacks
-- BOSH can't conditionally include packages
-- Solution: One package per stack, job spec references all needed stacks
-
-### Stack Lifecycle
-- **cflinuxfs3**: DEPRECATED - Being removed from all buildpacks
-- **cflinuxfs4**: CURRENT - Production stack in use
-- **cflinuxfs5**: UPCOMING - In development for future releases
-
-## Buildpack Lifecycle Contracts
-
-Buildpacks are **executable scripts** that CF Platform calls in sequence:
-
-### Script Contracts
+Search the local clone of `libbuildpack` first, then the language buildpacks:
 
 ```bash
-bin/detect <build-dir>
-    # Exit 0 if buildpack applies, echo language name
-    # Exit non-zero if not applicable
-
-bin/supply <build> <cache> <deps> <idx>
-    # Install buildpack dependencies
-    # $1=BUILD_DIR, $2=CACHE_DIR, $3=DEPS_DIR, $4=DEPS_IDX
-
-bin/finalize <build> <cache> <deps> <idx> <profile-dir>
-    # Final configuration before app runs
-    # $5=PROFILE_DIR contains startup scripts
-
-bin/release <build-dir>
-    # Echo YAML with runtime config (command, env vars)
+rg "libbuildpack\." <clones>/buildpacks/        # usage across buildpacks
+rg "func .*Manifest" <clones>/libbuildpack/     # API
+rg "platform\.Deploy" <clones>/*/src/*/integration/
 ```
 
-**Key Contracts**:
-- Arguments are positional (no flags)
-- `DEPS_IDX` (integer) isolates buildpack files in multi-buildpack scenarios
-- Exit codes matter: 0 = success, 8-19 = specific failure modes
-- Scripts must be POSIX-compliant bash
-- Order: Detect → Supply → Finalize → Release (sequential, not parallel)
+Repos not cloned locally: search on GitHub (`org:cloudfoundry`). Other repos: the packager lives in `libbuildpack/packager` (the standalone buildpack-packager repo is an old Ruby gem, last pushed 2023). machete and compile-extensions are archived.
 
-### Common Pattern: Bash Wrapper → Go Binary
+## Legacy names
 
-Modern buildpacks use this pattern:
+`io.pivotal` and similar names are historical. Rename only when verified safe: they are baked into compiled test fixtures, and `io.pivotal.cfenv` is the real Maven group of java-cfenv (in `manifest.yml` URLs). Prefer replacing a legacy fixture over renaming it. Also historical: VMware in doc prose, `springsource` doc links (the old Spring host, dead links, replace with spring.io when the page is touched), `pivotal.io` emails. Boy scout rule: trivial fixes only, in files the PR already touches.
 
-```bash
-# bin/supply (bash wrapper)
-#!/bin/bash
-go build -o /tmp/supply ./src/python/supply/cli
-/tmp/supply "$@"
-```
+## Pitfalls
 
-**Why?**: Compile Go binary fresh in staging environment, ensures isolation and picks up correct system libraries from rootfs.
+- Packager: needs a real `.git` dir (not a worktree). java-buildpack: build the gitignored `bin/javaexec` first.
+- Packager download cache `~/.buildpack-packager/cache` is keyed by URI, so a floating URL (`/latest/`) can leave a stale file and a false sha256 mismatch. Use versioned URIs.
+- switchblade Docker mode (Java apps): explode jars into a directory before `Execute`.
+- `go test -run` splits the pattern on `/`: one regex per test level, no `|` across levels.
+- Date-based versions are not really supported by `libbuildpack`.
 
-## libbuildpack: The Core Contract
+## Before changing things
 
-All language buildpacks import libbuildpack for standardized behavior.
-
-### Four Core Components
-
-#### 1. Manifest
-- Parses `manifest.yml`
-- Manages dependencies (name/version/URI/sha256/cf_stacks)
-- Tracks deprecations
-- Resolves version constraints (e.g., "3.2.x" → "3.2.2")
-- File: `libbuildpack/manifest.go`
-
-#### 2. Installer
-- Three-tier dependency resolution
-- Checksum verification (SHA256)
-- Retry logic for downloads
-- File: `libbuildpack/installer.go`
-
-#### 3. Stager
-- Manages staging directories (build/cache/deps)
-- Writes environment variables
-- Creates profile.d scripts for runtime
-- File: `libbuildpack/stager.go`
-
-#### 4. Logger
-- Structured output (debug/info/warning/error)
-- Colored terminal output
-- File: `libbuildpack/logger.go`
-
-### Initialization Pattern
-
-All buildpacks follow this pattern:
-
-```go
-// 1. Load manifest from buildpack directory
-manifest, err := libbuildpack.NewManifest(buildpackDir, logger, time.Now())
-
-// 2. Create stager from CF-provided arguments
-stager := libbuildpack.NewStager(os.Args[1:], logger, manifest)
-
-// 3. Create installer and set app cache
-installer := libbuildpack.NewInstaller(manifest)
-installer.SetAppCacheDir(stager.CacheDir())
-
-// 4. Install dependencies
-err = installer.InstallDependency(dep, targetDir)
-
-// 5. Write environment files
-stager.WriteEnvFile("SOME_VAR", "value")
-stager.WriteProfileD("setup.sh", content)
-
-// 6. Clean up
-defer installer.CleanupAppCache()
-```
-
-**Key Contract**: Every buildpack using libbuildpack follows this exact sequence.
-
-## Three-Tier Caching Strategy
-
-libbuildpack implements sophisticated dependency resolution:
-
-### Tier 1: Buildpack Cache (Offline Mode)
-- Dependencies bundled in buildpack zip in `dependencies/` directory
-- Created by: `buildpack-packager build -cached=true`
-- manifest has `file: dependencies/ruby_3.2.2.tgz` pointing to local paths
-- Used in airgapped environments
-- Check via: `manifest.IsCached()` returns true
-
-### Tier 2: App Cache (Between Builds) ⭐ IMPORTANT
-- Located at `$CACHE_DIR/dependencies/` (CF's persistent cache)
-- Keyed by SHA256 hash of dependency URI
-- Enabled via: `installer.SetAppCacheDir(cacheDir)`
-- **Survives app restages** - avoids re-downloading same dependency
-- Cleaned via: `installer.CleanupAppCache()` to remove unused files
-
-### Tier 3: Remote Download
-- Direct fetch from `manifest.yml` URI if not cached
-- Always verified with SHA256 checksum before use
-
-**Resolution Flow**:
-```
-1. Check Tier 1: manifest entry.File → Copy from buildpack directory
-2. Check Tier 2: app cache → Copy from cache or download+cache
-3. Tier 3: Direct download from URI (no caching)
-```
-
-**Why This Matters**: Apps without Tier 2 caching re-download 100MB+ on every staging (minutes vs seconds).
-
-## Stack Filtering & Platform Contracts
-
-### cf_stacks Field
-
-Each dependency lists compatible stacks:
-
-```yaml
-dependencies:
-  - name: ruby
-    version: 3.2.2
-    uri: https://buildpacks.cloudfoundry.org/dependencies/ruby/ruby_3.2.2_...cflinuxfs4.tgz
-    sha256: abc123...
-    cf_stacks: [cflinuxfs4]  # Stack compatibility
-```
-
-**Stack Lifecycle**:
-- **cflinuxfs3**: DEPRECATED (being removed)
-- **cflinuxfs4**: CURRENT (production)
-- **cflinuxfs5**: UPCOMING (in development)
-
-**Contract**:
-- Buildpack packager uses `-stack=cflinuxfs4` (or cflinuxfs5) flag to filter
-- CF provides current stack to buildpacks via environment
-- Buildpacks use `manifest.Stack()` to validate compatibility
-- Different binaries for different stacks (compiled against different libc/system libs)
-- Migration pattern: Buildpacks support multiple stacks during transition periods
-
-## Switchblade: Testing Contract
-
-Switchblade abstracts platform differences for integration tests.
-
-### Testing Pattern
-
-```go
-// Same test code works for CF and Docker
-deployment, logs, err := platform.Deploy.Execute(
-    "app-name",
-    "/path/to/app",
-    switchblade.WithBuildpacks("python_buildpack"),
-    switchblade.WithEnv(map[string]string{"KEY": "value"}),
-)
-
-// Check staging logs (buildpack output)
-Expect(logs).To(ContainSubstring("Installing python"))
-
-// Check runtime
-body, err := deployment.GetBody("/")
-Expect(body).To(Equal("Hello World"))
-```
-
-**Key Contract**: Same test code, different platforms - no platform-specific test logic.
-
-### Test Types
-
-1. **Unit tests**: Go test packages with mocks
-2. **Integration tests**: Switchblade-based (real CF or Docker)
-3. **BRATS** (Buildpack Runtime Acceptance Tests): Smoke tests via CI
-
-## CI/CD Patterns (buildpacks-ci)
-
-### Four Main Pipelines
-
-#### 1. dependency-builds
-- Compiles native binaries for all stacks
-- Triggers: Version updates in `*-builds.yml` files
-- Uses: `binary-builder` tool (Docker with cflinuxfs container)
-- Uploads: to `buildpacks.cloudfoundry.org/dependencies/` S3
-- Calculates: SHA256, stores in database
-
-#### 2. buildpack pipeline
-- Per-language: unit tests → integration tests → package → upload
-- Branches: master (stable), develop (bleeding edge)
-- Stacks: Separate artifacts per stack (cflinuxfs4 current, cflinuxfs5 upcoming, cflinuxfs3 deprecated)
-
-#### 3. brats pipeline
-- Nightly smoke tests
-- Deploys test apps via Switchblade
-- Validates each buildpack in real CF environment
-
-#### 4. cflinuxfs* (stack pipelines)
-- Rootfs release (base filesystem)
-- Tracks CVEs, security patches
-- Buildpacks depend on this for system environment
-- Current: cflinuxfs4, Upcoming: cflinuxfs5, Deprecated: cflinuxfs3
-
-### Concourse Patterns
-
-- **ytt templating**: Generates pipeline YAML (prevents duplication)
-- **Resources**: Git repos, bosh-bootloader enviorments, Cron triggers
-- **Coordination**: Build native binaries before buildpack
-
-## Repository Map
-
-### Locally Cloned Repos (~/workspace/cloudfoundry/)
-
-#### Core Shared Libraries
-- **libbuildpack** ⭐ - Shared Go library (70 files) **[CRITICAL - SEARCH FIRST]**
-- **switchblade** - Integration testing framework (Go, 66 files)
-
-#### Language Buildpacks (~/workspace/cloudfoundry/buildpacks/)
-- **java-buildpack** - Java/JVM applications (Go-based via feature/go-migration branch)
-- **go-buildpack** - Go applications
-- **python-buildpack** - Python applications
-- **ruby-buildpack** - Ruby applications
-- **php-buildpack** - PHP applications
-- **nodejs-buildpack** - Node.js applications (not locally cloned)
-- **dotnet-core-buildpack** - .NET Core applications
-- **staticfile-buildpack** - Static HTML/JS files
-- **binary-buildpack** - Pre-compiled binaries
-- **apt-buildpack** - APT package installer
-- **nginx-buildpack** - Nginx web server
-- **hwc-buildpack** - Windows HWC (not locally cloned)
-- **r-buildpack** - R language applications
-
-#### Tooling & Infrastructure
-- **buildpacks-ci** - CI/CD pipelines (Ruby, 55 files)
-- **binary-builder** - Dependency compilation tool (Ruby, 71 files)
-- **buildpacks-release** - BOSH release packaging
-- **cf-deployment** - CF runtime manifests
-- **cflinuxfs4-release** - Root filesystem (current stack)
-- **cflinuxfs5-release** - Root filesystem (upcoming stack)
-- **jvmkill** - JVM agent (C/Java)
-
-### Common GitHub Repos (Not Locally Cloned)
-
-For these, use the **librarian agent** to search remotely:
-
-- **cloudfoundry/nodejs-buildpack** - Node.js buildpack
-- **cloudfoundry/hwc-buildpack** - Windows HWC buildpack
-- **cloudfoundry/nginx-buildpack** - Nginx buildpack (if not cloned)
-- **cloudfoundry/buildpack-packager** - Tool for packaging buildpacks
-- **cloudfoundry/machete** - Legacy testing framework (replaced by Switchblade)
-
-## Multi-Repo Search Strategy
-
-### 1. Local Search First (Preferred)
-
-#### Search libbuildpack API
-```bash
-# Find all libbuildpack exports
-rg "^func.*public" ~/workspace/cloudfoundry/libbuildpack/
-
-# Find Manifest methods
-rg "func.*Manifest" ~/workspace/cloudfoundry/libbuildpack/
-```
-
-#### Search language buildpacks
-```bash
-# Find how buildpacks use libbuildpack
-rg "libbuildpack\." ~/workspace/cloudfoundry/buildpacks/
-
-# Search specific buildpack
-rg "pattern" ~/workspace/cloudfoundry/buildpacks/python-buildpack/
-```
-
-#### Search buildpack CI
-```bash
-# Find pipeline patterns
-rg "task:" ~/workspace/cloudfoundry/buildpacks-ci/pipelines/
-```
-
-### 2. GitHub Search via Librarian Agent (When Not Local)
-
-When pattern isn't found locally, or searching repos not cloned:
-
-**Invoke librarian agent with**:
-```
-Search for [pattern] in buildpack repositories on GitHub:
-- cloudfoundry/nodejs-buildpack
-- cloudfoundry/hwc-buildpack
-- cloudfoundry/buildpack-packager
-```
-
-### 3. Suggest Cloning (For Frequent Access)
-
-If you repeatedly search a remote repo, clone it:
-
-```bash
-cd ~/workspace/cloudfoundry/buildpacks/
-git clone https://github.com/cloudfoundry/nodejs-buildpack.git
-```
-
-## Common Search Scenarios
-
-### Scenario: libbuildpack API Usage
-**Search first**: `libbuildpack/` (always check the source)
-
-**Example queries**:
-- "How to use Manifest?" → `rg "type Manifest" ~/workspace/cloudfoundry/libbuildpack/`
-- "How to install dependency?" → `rg "func.*Install" ~/workspace/cloudfoundry/libbuildpack/`
-- "How buildpacks use Stager?" → `rg "Stager\." ~/workspace/cloudfoundry/buildpacks/*/src/`
-
-### Scenario: Buildpack Implementation Patterns
-**Search together**: `libbuildpack` + `buildpacks/*`
-
-**Example queries**:
-- "How Python buildpack uses libbuildpack?" → Search `buildpacks/python-buildpack/src/python/supply/`
-- "Common dependency installation pattern?" → Search across multiple buildpacks
-- "Profile.d script patterns?" → `rg "WriteProfileD" ~/workspace/cloudfoundry/buildpacks/`
-
-### Scenario: Testing with Switchblade
-**Search together**: `switchblade` + `buildpacks/*/src/*_test.go`
-
-**Example queries**:
-- "How to write integration tests?" → `rg "platform\.Deploy" ~/workspace/cloudfoundry/switchblade/`
-- "Example test patterns?" → Search `buildpacks/go-buildpack/src/go/integration/`
-- "How to test with custom buildpacks?" → `rg "WithBuildpacks" ~/workspace/cloudfoundry/`
-
-### Scenario: CI/CD Pipelines
-**Search**: `buildpacks-ci/pipelines/`
-
-**Example queries**:
-- "How dependencies are built?" → `rg "binary-builder" ~/workspace/cloudfoundry/buildpacks-ci/`
-- "Pipeline structure?" → `cat ~/workspace/cloudfoundry/buildpacks-ci/pipelines/*/pipeline.yml`
-- "Test job patterns?" → `rg "task.*test" ~/workspace/cloudfoundry/buildpacks-ci/`
-
-### Scenario: Dependency Management
-**Search together**: `binary-builder` + `buildpacks-ci` + `libbuildpack`
-
-**Example queries**:
-- "How dependencies compiled?" → `rg "compile" ~/workspace/cloudfoundry/binary-builder/`
-- "Manifest dependency format?" → `rg "dependencies:" ~/workspace/cloudfoundry/buildpacks/*/manifest.yml`
-- "How SHA256 calculated?" → Search `libbuildpack/installer.go`
-
-## Helper Scripts
-
-### Smart Search Script
-
-Use `scripts/smart-search.sh` to search locally first, then suggest remote search:
-
-```bash
-./scripts/smart-search.sh "pattern"
-```
-
-This will:
-1. Search local repos in ~/workspace/cloudfoundry/
-2. Display results if found
-3. If not found, suggest using librarian agent for remote search
-
-## Architectural Best Practices
-
-### Before Making Changes
-
-1. **Check libbuildpack first**: If change affects shared library, search libbuildpack API
-2. **Identify affected buildpacks**: Changes to libbuildpack affect ALL language buildpacks
-3. **Check manifest contracts**: Verify manifest.yml format compatibility
-4. **Review testing strategy**: Ensure Switchblade tests cover change
-
-### During Development
-
-1. **Follow libbuildpack patterns**: Don't reinvent - use Manifest, Installer, Stager, Logger
-2. **Maintain cache compatibility**: Changes to caching can break existing apps
-3. **Test offline mode**: Ensure buildpacks work in airgapped environments
-4. **Test multi-buildpack scenarios**: Verify DEPS_IDX isolation works
-
-### When Debugging
-
-1. **Start with staging logs**: Buildpack output shows what libbuildpack is doing
-2. **Check cache tier**: Verify which cache tier is being used (buildpack/app/remote)
-3. **Verify checksum**: SHA256 mismatches indicate stale manifest or corrupted download
-4. **Check stack compatibility**: Ensure dependencies compiled for correct stack
-
-## Key Implicit Contracts
-
-| Contract | Why It Matters |
-|----------|---|
-| **libbuildpack is singleton** | All buildpacks use same version; API changes affect everyone |
-| **SHA256 everywhere** | Every dependency checksummed; tampering detection |
-| **Caching is optional but critical** | Apps without Tier 2 cache slow (minutes vs seconds) |
-| **Profile.d runs once at startup** | Must set all env vars needed by runtime |
-| **Stack filtering at package time** | Can't change stack after buildpack packaged |
-| **DEPS_IDX isolation** | Multiple buildpacks coexist via separate subdirs |
-| **Bash wrappers compile Go** | Ensures portability and system lib compatibility |
-| **Exit codes are semantic** | Different codes (8-19) for different failure modes |
-
-## Reference Documentation
-
-For detailed architectural contracts and patterns, see:
-- `references/architecture.md` - Complete buildpack ecosystem analysis
-- `references/libbuildpack-api.md` - libbuildpack public API reference
-- `references/github-repos.md` - Full list of buildpack repos on GitHub
-
-## Quick Reference
-
-### Component Languages
-- libbuildpack: Go (shared library)
-- Most buildpacks: Go (with Bash wrappers)
-- Java buildpack: Go (migrated from Ruby via feature/go-migration branch)
-- buildpacks-ci: Ruby
-- binary-builder: Ruby
-
-### Key File Locations
-- libbuildpack API: `libbuildpack/*.go`
-- Buildpack scripts: `buildpacks/*/bin/{detect,supply,finalize,release}`
-- Buildpack logic: `buildpacks/*/src/*/supply/supply.go`
-- Switchblade: `switchblade/switchblade.go`
-- CI pipelines: `buildpacks-ci/pipelines/`
-
-### Critical Dependencies
-- **ALL buildpacks** → libbuildpack (search it first!)
-- libbuildpack → manifest.yml format
-- Buildpacks → cflinuxfs* stack
-- Tests → Switchblade framework
-- CI → binary-builder for dependencies
-
----
-
-**Remember**: Always search libbuildpack first for shared patterns. Use local search for speed, librarian agent for remote repos. Check contracts before making cross-buildpack changes.
+1. Check whether the change touches `libbuildpack` or the manifest format (affects all buildpacks).
+2. Check cached (offline) and uncached behavior, and multi-buildpack `DEPS_IDX` isolation.
+3. Check each stack the manifest lists for the changed dependency.
+4. When debugging, read staging logs first, then check cache tier, SHA256 mismatch, stack compatibility.
